@@ -176,11 +176,11 @@ def _train(config, logger, tokenizer):
     _print_batch(train_ds, valid_ds, tokenizer)
 
     model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer)
-    model.logger= wandb_logger
+    model.logger = wandb_logger
 
     # enable grads
     torch.set_grad_enabled(True)
-    opts, lr_schedules=model.configure_optimizers()
+    opts, lr_schedules = model.configure_optimizers()
 
     for ei in config.epoch:
         losses = []
@@ -194,10 +194,10 @@ def _train(config, logger, tokenizer):
             # clear gradients
             model.optimizer.zero_grad()
 
-            if config.check_val_every_n_epoch ==0:
+            if config.check_val_every_n_epoch == 0:
                 model.on_validation_epoch_start()
 
-            if config.checkpoint_freq==0:
+            if config.checkpoint_freq == 0:
                 model.on_save_checkpoint(ckpt_path=ckpt_path)
             # backward
             loss.backward()
@@ -232,8 +232,8 @@ def seed_everything(seed: int):
 
     print(f"Global seed set to {seed}")
 
-@hydra.main(version_base=None, config_path='configs',
-            config_name='config')
+
+@hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     """Main entry point for training."""
     seed_everything(config.seed)
