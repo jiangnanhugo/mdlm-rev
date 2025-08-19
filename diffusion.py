@@ -72,8 +72,10 @@ class Diffusion(nn.Module):
     def __init__(
             self,
             config,
-            tokenizer: transformers.PreTrainedTokenizer):
+            tokenizer: transformers.PreTrainedTokenizer,
+            dtype=torch.bfloat16):
         super().__init__()
+        self.dtype = dtype
 
         self.config = config
 
@@ -219,7 +221,7 @@ class Diffusion(nn.Module):
         # Adapted from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
         distributed = (
-                    self.trainer._accelerator_connector.use_distributed_sampler and self.trainer._accelerator_connector.is_distributed)
+                self.trainer._accelerator_connector.use_distributed_sampler and self.trainer._accelerator_connector.is_distributed)
         if distributed:
             sampler_cls = dataloader.FaultTolerantDistributedSampler
         else:
