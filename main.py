@@ -179,7 +179,7 @@ def _train(config, logger, tokenizer):
     torch.set_grad_enabled(True)
     opts, lr_schedules = model.configure_optimizers()
 
-    for ei in config.epoch:
+    for ei in config.trainer.max_steps:
         losses = []
         for batch in train_ds:
             # calls hooks like this one
