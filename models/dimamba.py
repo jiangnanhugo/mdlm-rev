@@ -8,15 +8,9 @@ import omegaconf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+
 from einops import rearrange, repeat
-from mamba_ssm.ops.selective_scan_interface import (
-    mamba_inner_fn,
-    selective_scan_fn,
-)
+
 from torch import Tensor
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import (
@@ -168,7 +162,15 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
+        from causal_conv1d import (
+            causal_conv1d_fn,
+            causal_conv1d_update,
+        )
 
+        from mamba_ssm.ops.selective_scan_interface import (
+            mamba_inner_fn,
+            selective_scan_fn,
+        )
         if (
             self.use_fast_path
             and causal_conv1d_fn is not None
