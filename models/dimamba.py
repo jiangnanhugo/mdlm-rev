@@ -26,9 +26,7 @@ try:
     )
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-from mamba_ssm.ops.triton.selective_state_update import (
-    selective_state_update,
-)
+
 
 from models.dit import (
     TimestepEmbedder,
@@ -282,6 +280,10 @@ class Mamba(nn.Module):
         # Don't add dt_bias here
         dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
+
+        from mamba_ssm.ops.triton.selective_state_update import (
+            selective_state_update,
+        )
 
         # SSM step
         if selective_state_update is None:
