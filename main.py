@@ -31,7 +31,7 @@ def _load_from_checkpoint(config, tokenizer):
         config=config)
 
 
-@L.pytorch.utilities.rank_zero_only
+# @L.pytorch.utilities.rank_zero_only
 def _print_config(
         config: omegaconf.DictConfig,
         resolve: bool = True,
@@ -66,7 +66,7 @@ def _print_config(
             rich.print(tree, file=fp)
 
 
-@L.pytorch.utilities.rank_zero_only
+# @L.pytorch.utilities.rank_zero_only
 def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     for dl_type, dl in [('train', train_ds), ('valid', valid_ds)]:
         print(f'Printing {dl_type} dataloader batch.')
