@@ -188,7 +188,9 @@ def _train(config, logger, tokenizer):
     
     for ei in range(config.trainer.max_steps):
         losses = []
-        for batch in train_ds:
+        
+        for idx, batch in enumerate(train_ds):
+            print(f"Training step {ei}, batch {idx + 1}/{len(train_ds)}")
             # Move batch tensors to the correct device
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
