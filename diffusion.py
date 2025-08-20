@@ -157,6 +157,11 @@ class Diffusion(nn.Module):
         self.fast_forward_batches = None
         self._validate_configuration()
 
+    def to_device(self, device: torch.device):
+        self.backbone.to_device(device)
+        self.backbone = self.backbone.to(device)
+        self.noise = self.noise.to(device)
+
     def _validate_configuration(self):
         assert not (self.change_of_variables and self.importance_sampling)
         if self.parameterization == 'sedd':
@@ -251,13 +256,6 @@ class Diffusion(nn.Module):
                     persistent_workers=True))
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
-    def optimizer_step(self, *args, **kwargs):
-        super().optimizer_step(*args, **kwargs)
-        if self.ema:
-            self.ema.update(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
-
     def _subs_parameterization(self, logits, xt):
         # log prob at the mask index = - infinity
         logits[:, :, self.mask_index] += self.neg_infinity
@@ -312,7 +310,7 @@ class Diffusion(nn.Module):
     def forward(self, x, sigma):
         """Returns log score."""
         sigma = self._process_sigma(sigma)
-        with torch.cuda.amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast('cuda', dtype=torch.float32):
             logits = self.backbone(x, sigma)
 
         if self.parameterization == 'subs':
@@ -362,6 +360,7 @@ class Diffusion(nn.Module):
             attention_mask = batch['attention_mask']
         else:
             attention_mask = None
+
         losses = self._loss(batch['input_ids'], attention_mask)
         loss = losses.loss
 
@@ -381,21 +380,18 @@ class Diffusion(nn.Module):
         #               on_step=False,
         #               on_epoch=True,
         #               sync_dist=True)
-        print(metrics)
+        self.logger.log(metrics)
         return loss
 
     def on_train_epoch_start(self):
         self.backbone.train()
         self.noise.train()
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx=None):
         loss = self._compute_loss(batch, prefix='train')
-        # self.log(name='trainer/loss',
-        #          value=loss.item(),
-        #          on_step=True,
-        #          on_epoch=False,
-        #          sync_dist=True)
-        self.logger({'trainer/loss', loss.item()})
+        print(type(self.logger))
+        # self.logger.log()
+        self.logger.log({'trainer/loss': loss.item()})
         return loss
 
     def on_validation_epoch_start(self):
@@ -438,11 +434,20 @@ class Diffusion(nn.Module):
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
             if self.config.eval.compute_generative_perplexity:
-                self.logger({'val/gen_ppl', self.gen_ppl_metric})
+                self.logger.log({'val/gen_ppl': self.gen_ppl_metric})
         if self.ema:
             self.ema.restore(
                 itertools.chain(self.backbone.parameters(),
                                 self.noise.parameters()))
+
+    def optimizer_step(self,optimizer, scheduler=None):
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        if self.ema:
+            self.ema.update(itertools.chain(
+                self.backbone.parameters(),
+                self.noise.parameters()))
 
     def configure_optimizers(self):
         # TODO(yair): Lightning currently giving this warning when using `fp16`:
@@ -463,7 +468,7 @@ class Diffusion(nn.Module):
             'monitor': 'val/loss',
             'name': 'trainer/lr',
         }
-        return [optimizer], [scheduler_dict]
+        return optimizer, scheduler_dict
 
     @torch.no_grad()
     def eval_retokenize(self, text_samples, max_length):

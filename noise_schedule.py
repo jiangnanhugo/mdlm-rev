@@ -21,9 +21,7 @@ def get_noise(config, dtype=torch.float32):
   elif config.noise.type == 'cosinesqr':
     return CosineSqrNoise()
   elif config.noise.type == 'linear':
-    return Linear(config.noise.sigma_min,
-                  config.noise.sigma_max,
-                  dtype)
+    return Linear(config.noise.sigma_min, config.noise.sigma_max, dtype)
   else:
     raise ValueError(f'{config.noise.type} is not a valid noise')
 

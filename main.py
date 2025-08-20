@@ -19,6 +19,8 @@ omegaconf.OmegaConf.register_new_resolver('device_count', torch.cuda.device_coun
 omegaconf.OmegaConf.register_new_resolver('eval', eval)
 omegaconf.OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // y)
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def _load_from_checkpoint(config, tokenizer):
     if 'hf' in config.backbone:
@@ -173,23 +175,33 @@ def _train(config, logger, tokenizer):
     _print_batch(train_ds, valid_ds, tokenizer)
 
     model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer)
+    model = model.to(device)
+    # model.to_device(device)  # Move model to CUDA
     model.logger = wandb_logger
 
     # enable grads
     torch.set_grad_enabled(True)
-    opts, lr_schedules = model.configure_optimizers()
+    optimizer, schedule_dict = model.configure_optimizers()
 
-    for ei in config.trainer.max_steps:
+    for ei in range(config.trainer.max_steps):
         losses = []
         for batch in train_ds:
             # calls hooks like this one
             model.on_train_epoch_start()
-
+            
+            # Move batch tensors to the correct device
+            if isinstance(batch, dict):
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        batch[key] = value.to(device)
+            else:
+                batch = batch.to(device)
+            
             # train step
             loss = model.training_step(batch)
 
             # clear gradients
-            model.optimizer.zero_grad()
+            optimizer.zero_grad()
 
             if config.check_val_every_n_epoch == 0:
                 model.on_validation_epoch_start()
