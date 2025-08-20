@@ -61,7 +61,7 @@ optim:
   eps: 1e-8
 
 trainer:
-  _target_: lightning.Trainer
+  # _target_: lightning.Trainer
   accelerator: cuda
   num_nodes: 1
   devices: ${device_count:}

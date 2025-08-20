@@ -220,41 +220,80 @@ class Diffusion(nn.Module):
         else:
             checkpoint['sampler']['random_state'] = None
 
-    def on_train_start(self):
+    def on_train_start(self, train_dl, device=None):
+        
         if self.ema:
-            self.ema.move_shadow_params_to_device(self.device)
+            
+            self.ema.move_shadow_params_to_device(device)
+        
+        ## Put modules in train mode
+        self.backbone.train()
+        self.noise.train()
+        
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         # Adapted from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
-        distributed = (
-                self.trainer._accelerator_connector.use_distributed_sampler and self.trainer._accelerator_connector.is_distributed)
+        # distributed = (
+        #         self.trainer._accelerator_connector.use_distributed_sampler and self.trainer._accelerator_connector.is_distributed)
+        
         if distributed:
             sampler_cls = dataloader.FaultTolerantDistributedSampler
         else:
             sampler_cls = dataloader.RandomFaultTolerantSampler
-        updated_dls = []
-        for dl in self.trainer.fit_loop._combined_loader.flattened:
-            if hasattr(dl.sampler, 'shuffle'):
-                dl_sampler = sampler_cls(
-                    dl.dataset, shuffle=dl.sampler.shuffle)
-            else:
-                dl_sampler = sampler_cls(dl.dataset)
-            if (distributed
-                    and self.fast_forward_epochs is not None
-                    and self.fast_forward_batches is not None):
-                dl_sampler.load_state_dict({
-                    'epoch': self.fast_forward_epochs,
-                    'counter': (self.fast_forward_batches
-                                * self.config.loader.batch_size)})
-            updated_dls.append(
-                torch.utils.data.DataLoader(
-                    dl.dataset,
-                    batch_size=self.config.loader.batch_size,
-                    num_workers=self.config.loader.num_workers,
-                    pin_memory=self.config.loader.pin_memory,
-                    sampler=dl_sampler,
-                    shuffle=False,
-                    persistent_workers=True))
-        self.trainer.fit_loop._combined_loader.flattened = updated_dls
+        
+        # Preserve "shuffle" flag if the old sampler had one
+        if hasattr(train_dl.sampler, "shuffle"):
+            dl_sampler = sampler_cls(train_dl.dataset, shuffle=train_dl.sampler.shuffle)
+        else:
+            dl_sampler = sampler_cls(train_dl.dataset)
+
+        # If you’re NOT resuming, you can drop fast-forward entirely.
+        # Leaving this branch is harmless (it just won't run).
+        if (distributed
+            and self.fast_forward_epochs is not None
+            and self.fast_forward_batches is not None):
+            dl_sampler.load_state_dict({
+                "epoch": self.fast_forward_epochs,
+                "counter": self.fast_forward_batches * self.config.loader.batch_size,
+            })
+
+
+        new_train_dl = torch.utils.data.DataLoader(
+            train_dl.dataset,
+            batch_size=self.config.loader.batch_size,
+            num_workers=self.config.loader.num_workers,
+            pin_memory=self.config.loader.pin_memory,
+            sampler=dl_sampler,
+            shuffle=False,                 # sampler controls order
+            persistent_workers=True,
+        )
+        return new_train_dl
+        
+        # updated_dls = []
+        # for dl in self.trainer.fit_loop._combined_loader.flattened:
+        #     if hasattr(dl.sampler, 'shuffle'):
+        #         dl_sampler = sampler_cls(
+        #             dl.dataset, shuffle=dl.sampler.shuffle)
+        #     else:
+        #         dl_sampler = sampler_cls(dl.dataset)
+        #     if (distributed
+        #             and self.fast_forward_epochs is not None
+        #             and self.fast_forward_batches is not None):
+        #         dl_sampler.load_state_dict({
+        #             'epoch': self.fast_forward_epochs,
+        #             'counter': (self.fast_forward_batches
+        #                         * self.config.loader.batch_size)})
+        #     updated_dls.append(
+        #         torch.utils.data.DataLoader(
+        #             dl.dataset,
+        #             batch_size=self.config.loader.batch_size,
+        #             num_workers=self.config.loader.num_workers,
+        #             pin_memory=self.config.loader.pin_memory,
+        #             sampler=dl_sampler,
+        #             shuffle=False,
+        #             persistent_workers=True))
+            
+        # self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def _subs_parameterization(self, logits, xt):
         # log prob at the mask index = - infinity
@@ -380,16 +419,12 @@ class Diffusion(nn.Module):
         #               on_step=False,
         #               on_epoch=True,
         #               sync_dist=True)
-        self.logger.log(metrics)
+        self.logger.log({'metrics': metrics})
         return loss
 
-    def on_train_epoch_start(self):
-        self.backbone.train()
-        self.noise.train()
 
     def training_step(self, batch, batch_idx=None):
         loss = self._compute_loss(batch, prefix='train')
-        print(type(self.logger))
         # self.logger.log()
         self.logger.log({'trainer/loss': loss.item()})
         return loss
@@ -440,10 +475,10 @@ class Diffusion(nn.Module):
                 itertools.chain(self.backbone.parameters(),
                                 self.noise.parameters()))
 
-    def optimizer_step(self,optimizer, scheduler=None):
+    def optimizer_step(self,optimizer, scheduler):
         optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        scheduler.step()
+            
         if self.ema:
             self.ema.update(itertools.chain(
                 self.backbone.parameters(),

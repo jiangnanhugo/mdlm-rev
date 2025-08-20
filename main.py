@@ -176,26 +176,23 @@ def _train(config, logger, tokenizer):
 
     model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer)
     model = model.to(device)
-    # model.to_device(device)  # Move model to CUDA
     model.logger = wandb_logger
 
     # enable grads
     torch.set_grad_enabled(True)
-    optimizer, schedule_dict = model.configure_optimizers()
-
+    train_ds = model.on_train_start(train_ds, device)
+    
+    # optimizer, schedule_dict = model.configure_optimizers()
+    optimizer, sched_dict = model.configure_optimizers()
+    scheduler = sched_dict.get("scheduler", None)  # interval='step' in your config
+    
     for ei in range(config.trainer.max_steps):
         losses = []
         for batch in train_ds:
-            # calls hooks like this one
-            model.on_train_epoch_start()
-            
             # Move batch tensors to the correct device
-            if isinstance(batch, dict):
-                for key, value in batch.items():
-                    if isinstance(value, torch.Tensor):
-                        batch[key] = value.to(device)
-            else:
-                batch = batch.to(device)
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device, non_blocking=True)
             
             # train step
             loss = model.training_step(batch)
@@ -203,18 +200,20 @@ def _train(config, logger, tokenizer):
             # clear gradients
             optimizer.zero_grad()
 
-            if config.check_val_every_n_epoch == 0:
-                model.on_validation_epoch_start()
-
-            if config.checkpoint_freq == 0:
-                model.on_save_checkpoint(ckpt_path=ckpt_path)
             # backward
             loss.backward()
 
             # update parameters
-            model.optimizer_step()
+            model.optimizer_step(optimizer, scheduler)
 
             losses.append(loss)
+            
+            if config.trainer.val_check_interval == 0:
+                model.on_validation_epoch_start()
+
+            if config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
+                model.on_save_checkpoint(ckpt_path=ckpt_path)
+    
 
 
 def seed_everything(seed: int):

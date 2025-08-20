@@ -40,9 +40,9 @@ class ExponentialMovingAverage:
     decay = self.decay
     if self.num_updates is not None:
       self.num_updates += 1
-      decay = min(decay, (1 + self.num_updates) /
-                  (10 + self.num_updates))
+      decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
     one_minus_decay = 1.0 - decay
+    
     with torch.no_grad():
       parameters = [p for p in parameters if p.requires_grad]
       for s_param, param in zip(self.shadow_params, parameters):
