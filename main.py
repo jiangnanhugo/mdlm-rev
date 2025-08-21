@@ -1,26 +1,31 @@
 import fsspec
 import hydra
-import lightning as L
+# import lightning as L
 import omegaconf
-import rich.syntax
-import rich.tree
+
 
 import os
-import random
-import numpy as np
 import torch
+import tqdm
 
 import dataloader
 import diffusion
 import utils
+
+# DDP
+import torch.multiprocessing as mp
+from torch.distributed import init_process_group, destroy_process_group
 
 omegaconf.OmegaConf.register_new_resolver('cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver('device_count', torch.cuda.device_count)
 omegaconf.OmegaConf.register_new_resolver('eval', eval)
 omegaconf.OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // y)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def ddp_setup():
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    init_process_group(backend="nccl")
 
 def _load_from_checkpoint(config, tokenizer):
     if 'hf' in config.backbone:
@@ -38,6 +43,9 @@ def _print_config(
         config: omegaconf.DictConfig,
         resolve: bool = True,
         save_cfg: bool = True) -> None:
+    import rich.syntax
+    import rich.tree
+
     """Prints content of DictConfig using Rich library and its tree structure.
 
     Args:
@@ -125,9 +133,16 @@ def _ppl_eval(config, logger, tokenizer):
 
     wandb_logger = None
     if config.get('wandb', None) is not None:
-        wandb_logger = L.pytorch.loggers.WandbLogger(
-            config=omegaconf.OmegaConf.to_object(config),
-            **config.wandb)
+        # wandb_logger = L.pytorch.loggers.WandbLogger(
+        #     config=omegaconf.OmegaConf.to_object(config),
+        #     **config.wandb)
+        import wandb
+        wandb_config = omegaconf.OmegaConf.to_container(config, resolve=True)
+        wandb_logger = wandb.init(
+            project=config.wandb.get("project", "default_project"),
+            config=wandb_config,
+            **{k: v for k, v in config.wandb.items() if k != "project"}
+        )
     callbacks = []
     if 'callbacks' in config:
         for _, callback in config.callbacks.items():
@@ -144,7 +159,7 @@ def _ppl_eval(config, logger, tokenizer):
 
 
 def _train(config, logger, tokenizer):
-    logger.info('Starting Training.')
+
     wandb_logger = None
     if config.get('wandb', None) is not None:
         import wandb
@@ -156,6 +171,9 @@ def _train(config, logger, tokenizer):
             **{k: v for k, v in config.wandb.items() if k != "project"}
         )
 
+    ddp_setup()
+    logger.info('Starting Training.')
+
     if (config.checkpointing.resume_from_ckpt
             and config.checkpointing.resume_ckpt_path is not None
             and utils.fsspec_exists(
@@ -164,7 +182,7 @@ def _train(config, logger, tokenizer):
     else:
         ckpt_path = None
 
-    # Lightning callbacks
+    # callbacks
     callbacks = []
     if 'callbacks' in config:
         for _, callback in config.callbacks.items():
@@ -174,28 +192,33 @@ def _train(config, logger, tokenizer):
 
     _print_batch(train_ds, valid_ds, tokenizer)
 
-    model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer)
-    model = model.to(device)
+    model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer, save_every=100, snapshot_path="snapshot.ckpt")
+    # model = model.to(device)
     model.logger = wandb_logger
 
     # enable grads
     torch.set_grad_enabled(True)
-    train_ds = model.on_train_start(train_ds, device)
-    
+    train_ds = model.on_train_start(train_ds)
+
     # optimizer, schedule_dict = model.configure_optimizers()
     optimizer, sched_dict = model.configure_optimizers()
     scheduler = sched_dict.get("scheduler", None)  # interval='step' in your config
-    
+
     for ei in range(config.trainer.max_steps):
         losses = []
-        
+
         for idx, batch in enumerate(train_ds):
-            print(f"Training step {ei}, batch {idx + 1}/{len(train_ds)}")
+            if (idx + 1) % config.trainer.log_every_n_steps == 0:
+                arr = torch.tensor(losses)
+                print(
+                    f"GPU: {model.gpu_id}, Training epoch {ei}, batch {idx + 1}/{len(train_ds)}, loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}",
+                    end="\n", flush=True)
+                # sys.stdout.flush()
             # Move batch tensors to the correct device
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    batch[k] = v.to(device, non_blocking=True)
-            
+            # for k, v in batch.items():
+            #     if isinstance(v, torch.Tensor):
+            #         batch[k] = v.to(device, non_blocking=True)
+
             # train step
             loss = model.training_step(batch)
 
@@ -208,45 +231,32 @@ def _train(config, logger, tokenizer):
             # update parameters
             model.optimizer_step(optimizer, scheduler)
 
-            losses.append(loss)
-            
-            if config.trainer.val_check_interval == 0:
+            losses.append(loss.detach())
+
+            if (idx + 1) % config.trainer.val_check_interval == 0:
+                print("Validation step...")
                 model.on_validation_epoch_start()
+                val_losses = []
+                for val_batch in tqdm.tqdm(valid_ds):
+                    for k, v in val_batch.items():
+                        if isinstance(v, torch.Tensor):
+                            val_batch[k] = v.to(device, non_blocking=True)
+                    val_loss = model.validation_step(val_batch)
+                    val_losses.append(val_loss.detach())
+                    model.logger.log({"val_loss": val_loss})
+                print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+                model.on_validation_epoch_end()
 
             if config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
                 model.on_save_checkpoint(ckpt_path=ckpt_path)
-    
 
-
-def seed_everything(seed: int):
-    # Python built-in RNG
-    random.seed(seed)
-
-    # NumPy RNG
-    np.random.seed(seed)
-
-    # Torch RNG (CPU)
-    torch.manual_seed(seed)
-
-    # Torch RNG (all CUDA devices, if available)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    # For reproducibility
-    os.environ["PYTHONHASHSEED"] = str(seed)
-
-    # Allow nondeterminism for speed
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
-
-    print(f"Global seed set to {seed}")
+    destroy_process_group()
 
 
 @hydra.main(version_base=None, config_path='configs', config_name='config')
 def main(config):
     """Main entry point for training."""
-    seed_everything(config.seed)
+    utils.seed_everything(config.seed)
     _print_config(config, resolve=True, save_cfg=True)
 
     logger = utils.get_logger(__name__)
@@ -257,6 +267,9 @@ def main(config):
     elif config.mode == 'ppl_eval':
         _ppl_eval(config, logger, tokenizer)
     else:
+        # world_size = torch.cuda.device_count()
+        # mp.spawn(_train, args=(world_size, logger, tokenizer), nprocs=world_size)
+
         _train(config, logger, tokenizer)
 
 

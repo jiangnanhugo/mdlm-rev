@@ -21,6 +21,9 @@ import utils
 
 LOG2 = math.log(2)
 
+# DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 def _sample_categorical(categorical_probs):
     gumbel_norm = (
@@ -30,9 +33,7 @@ def _sample_categorical(categorical_probs):
 
 
 def _unsqueeze(x, reference):
-    return x.view(
-        *x.shape,
-        *((1,) * (len(reference.shape) - len(x.shape))))
+    return x.view(*x.shape, *((1,) * (len(reference.shape) - len(x.shape))))
 
 
 @dataclass
@@ -66,24 +67,26 @@ class Perplexity(NLL):
         return torch.exp(self.mean_value / self.weight)
 
 
-class Diffusion(nn.Module):
+class Diffusion:
     logger = None
 
     def __init__(
             self,
             config,
             tokenizer: transformers.PreTrainedTokenizer,
-            dtype=torch.bfloat16):
-        super().__init__()
+            save_every: int,
+            snapshot_path: str,
+            dtype=torch.bfloat16, ):
+        # super().__init__()
         self.dtype = dtype
+        self.gpu_id = int(os.environ["LOCAL_RANK"])
 
         self.config = config
 
         self.tokenizer = tokenizer
         self.vocab_size = self.tokenizer.vocab_size
         self.sampler = self.config.sampling.predictor
-        self.gen_ppl_eval_model_name_or_path = self.config.eval. \
-            gen_ppl_eval_model_name_or_path
+        self.gen_ppl_eval_model_name_or_path = self.config.eval.gen_ppl_eval_model_name_or_path
         self.antithetic_sampling = self.config.training.antithetic_sampling
         self.importance_sampling = self.config.training.importance_sampling
         self.change_of_variables = self.config.training.change_of_variables
@@ -95,8 +98,8 @@ class Diffusion(nn.Module):
             self.mask_index = self.tokenizer.mask_token_id
         self.parameterization = self.config.parameterization
         if self.config.backbone == 'dit':
-            self.backbone = models.dit.DIT(
-                self.config, vocab_size=self.vocab_size)
+            self.backbone = models.dit.DIT(self.config,
+                                           vocab_size=self.vocab_size)
         elif self.config.backbone == 'dimamba':
             self.backbone = models.dimamba.DiMamba(
                 self.config,
@@ -113,6 +116,15 @@ class Diffusion(nn.Module):
         else:
             raise ValueError(
                 f'Unknown backbone: {self.config.backbone}')
+
+        ## BEGIN: add support for DDP
+        self.backbone = self.backbone.to(self.gpu_id)
+        self.backbone = DDP(self.backbone, device_ids=[self.gpu_id])
+        self.save_every = save_every
+        if os.path.exists(snapshot_path):
+            print("Loading snapshot")
+            # self._load_snapshot(snapshot_path)
+        ## END: add support for DDP
 
         self.T = self.config.T
         self.subs_masking = self.config.subs_masking
@@ -134,13 +146,10 @@ class Diffusion(nn.Module):
         self.eval_model_tokenizer = transformers.AutoTokenizer. \
             from_pretrained(self.gen_ppl_eval_model_name_or_path)
         if self.eval_model_tokenizer.pad_token is None:
-            self.eval_model_tokenizer.pad_token = \
-                self.eval_model_tokenizer.eos_token
-            self.eval_model_tokenizer.pad_token_id = \
-                self.eval_model_tokenizer.eos_token_id
+            self.eval_model_tokenizer.pad_token = self.eval_model_tokenizer.eos_token
+            self.eval_model_tokenizer.pad_token_id = self.eval_model_tokenizer.eos_token_id
 
-        self.noise = noise_schedule.get_noise(self.config,
-                                              dtype=self.dtype)
+        self.noise = noise_schedule.get_noise(self.config, dtype=self.dtype)
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
                 itertools.chain(self.backbone.parameters(),
@@ -156,11 +165,6 @@ class Diffusion(nn.Module):
         self.fast_forward_epochs = None
         self.fast_forward_batches = None
         self._validate_configuration()
-
-    def to_device(self, device: torch.device):
-        self.backbone.to_device(device)
-        self.backbone = self.backbone.to(device)
-        self.noise = self.noise.to(device)
 
     def _validate_configuration(self):
         assert not (self.change_of_variables and self.importance_sampling)
@@ -184,6 +188,14 @@ class Diffusion(nn.Module):
         self.fast_forward_batches = checkpoint['loops'][
             'fit_loop']['epoch_loop.batch_progress'][
             'current']['completed']
+
+    def _save_snapshot(self, epoch):
+        snapshot = {
+            "MODEL_STATE": self.backbone.module.state_dict(),
+            "EPOCHS_RUN": epoch,
+        }
+        torch.save(snapshot, self.snapshot_path)
+        print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
 
     def on_save_checkpoint(self, checkpoint):
         if self.ema:
@@ -220,27 +232,30 @@ class Diffusion(nn.Module):
         else:
             checkpoint['sampler']['random_state'] = None
 
-    def on_train_start(self, train_dl, device=None):
-        
+    def on_train_start(self, train_dl):
+
         if self.ema:
-            
-            self.ema.move_shadow_params_to_device(device)
-        
+            self.ema.move_shadow_params_to_device(self.gpu_id)
+
         ## Put modules in train mode
         self.backbone.train()
         self.noise.train()
-        
+        #
+        self.train_metrics.reset()
+
         distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
         # Adapted from:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
         # distributed = (
         #         self.trainer._accelerator_connector.use_distributed_sampler and self.trainer._accelerator_connector.is_distributed)
-        
+
         if distributed:
             sampler_cls = dataloader.FaultTolerantDistributedSampler
+            print("use distributed sampler: FaultTolerantDistributedSampler")
         else:
             sampler_cls = dataloader.RandomFaultTolerantSampler
-        
+            print("use random sampler: RandomFaultTolerantSampler")
+
         # Preserve "shuffle" flag if the old sampler had one
         if hasattr(train_dl.sampler, "shuffle"):
             dl_sampler = sampler_cls(train_dl.dataset, shuffle=train_dl.sampler.shuffle)
@@ -250,13 +265,12 @@ class Diffusion(nn.Module):
         # If you’re NOT resuming, you can drop fast-forward entirely.
         # Leaving this branch is harmless (it just won't run).
         if (distributed
-            and self.fast_forward_epochs is not None
-            and self.fast_forward_batches is not None):
+                and self.fast_forward_epochs is not None
+                and self.fast_forward_batches is not None):
             dl_sampler.load_state_dict({
                 "epoch": self.fast_forward_epochs,
                 "counter": self.fast_forward_batches * self.config.loader.batch_size,
             })
-
 
         new_train_dl = torch.utils.data.DataLoader(
             train_dl.dataset,
@@ -264,11 +278,11 @@ class Diffusion(nn.Module):
             num_workers=self.config.loader.num_workers,
             pin_memory=self.config.loader.pin_memory,
             sampler=dl_sampler,
-            shuffle=False,                 # sampler controls order
+            shuffle=False,  # sampler controls order
             persistent_workers=True,
         )
         return new_train_dl
-        
+
         # updated_dls = []
         # for dl in self.trainer.fit_loop._combined_loader.flattened:
         #     if hasattr(dl.sampler, 'shuffle'):
@@ -292,7 +306,7 @@ class Diffusion(nn.Module):
         #             sampler=dl_sampler,
         #             shuffle=False,
         #             persistent_workers=True))
-            
+
         # self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     def _subs_parameterization(self, logits, xt):
@@ -422,7 +436,6 @@ class Diffusion(nn.Module):
         self.logger.log({'metrics': metrics})
         return loss
 
-
     def training_step(self, batch, batch_idx=None):
         loss = self._compute_loss(batch, prefix='train')
         # self.logger.log()
@@ -431,23 +444,20 @@ class Diffusion(nn.Module):
 
     def on_validation_epoch_start(self):
         if self.ema:
-            self.ema.store(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
-            self.ema.copy_to(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.store(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
+            self.ema.copy_to(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
         self.backbone.eval()
         self.noise.eval()
+        self.valid_metrics.reset()
+
         assert self.valid_metrics.nll.mean_value == 0
         assert self.valid_metrics.nll.weight == 0
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx=None):
         return self._compute_loss(batch, prefix='val')
 
     def on_validation_epoch_end(self):
-        if ((self.config.eval.compute_perplexity_on_sanity
-             or not self.trainer.sanity_checking)
+        if (self.config.eval.compute_perplexity_on_sanity  # or not self.trainer.sanity_checking
                 and self.config.eval.generate_samples
                 and not self.parameterization == 'ar'):
             # TODO(justin): implement sampling and kv cache for AR
@@ -459,12 +469,11 @@ class Diffusion(nn.Module):
                 text_samples = self.tokenizer.batch_decode(samples)
                 if self.config.eval.compute_generative_perplexity:
                     self.compute_generative_perplexity(text_samples)
-            if self.trainer.global_rank == 0 and hasattr(
-                    self.trainer.logger, 'log_table'):
+            if hasattr(self.logger, 'log_table'):  # self.trainer.global_rank == 0 and
                 # Log the last generated samples
                 text_samples = text_samples[
                     : self.config.sampling.num_sample_log]
-                self.trainer.logger.log_table(
+                self.logger.log_table(
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
@@ -475,13 +484,11 @@ class Diffusion(nn.Module):
                 itertools.chain(self.backbone.parameters(),
                                 self.noise.parameters()))
 
-    def optimizer_step(self,optimizer, scheduler):
+    def optimizer_step(self, optimizer, scheduler):
         optimizer.step()
         scheduler.step()
         if self.ema:
-            self.ema.update(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.update(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
 
     def configure_optimizers(self):
         # TODO(yair): Lightning currently giving this warning when using `fp16`:
