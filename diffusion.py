@@ -478,7 +478,6 @@ class Diffusion(nn.Module):
     def optimizer_step(self,optimizer, scheduler):
         optimizer.step()
         scheduler.step()
-            
         if self.ema:
             self.ema.update(itertools.chain(
                 self.backbone.parameters(),
