@@ -3,7 +3,6 @@ import hydra
 # import lightning as L
 import omegaconf
 
-
 import os
 import torch
 import tqdm
@@ -22,10 +21,10 @@ omegaconf.OmegaConf.register_new_resolver('eval', eval)
 omegaconf.OmegaConf.register_new_resolver('div_up', lambda x, y: (x + y - 1) // y)
 
 
-
 def ddp_setup():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     init_process_group(backend="nccl")
+
 
 def _load_from_checkpoint(config, tokenizer):
     if 'hf' in config.backbone:
@@ -112,8 +111,7 @@ def generate_samples(config, logger, tokenizer):
             # and diffusion.compute_generative_perplexity() discards
             # any text after the first EOS token.
         else:
-            samples = model.restore_model_and_sample(
-                num_steps=config.sampling.steps)
+            samples = model.restore_model_and_sample(num_steps=config.sampling.steps)
             text_samples = model.tokenizer.batch_decode(samples)
             model.compute_generative_perplexity(text_samples)
     print('Text samples:', text_samples)
@@ -159,7 +157,6 @@ def _ppl_eval(config, logger, tokenizer):
 
 
 def _train(config, logger, tokenizer):
-
     wandb_logger = None
     if config.get('wandb', None) is not None:
         import wandb
@@ -170,9 +167,6 @@ def _train(config, logger, tokenizer):
             config=wandb_config,
             **{k: v for k, v in config.wandb.items() if k != "project"}
         )
-
-    ddp_setup()
-    logger.info('Starting Training.')
 
     if (config.checkpointing.resume_from_ckpt
             and config.checkpointing.resume_ckpt_path is not None
@@ -190,8 +184,8 @@ def _train(config, logger, tokenizer):
 
     train_ds, valid_ds = dataloader.get_dataloaders(config, tokenizer)
 
-    _print_batch(train_ds, valid_ds, tokenizer)
-
+    ddp_setup()
+    logger.info('Starting Training.')
     model = diffusion.Diffusion(config, tokenizer=valid_ds.tokenizer, save_every=100, snapshot_path="snapshot.ckpt")
     # model = model.to(device)
     model.logger = wandb_logger
@@ -199,25 +193,26 @@ def _train(config, logger, tokenizer):
     # enable grads
     torch.set_grad_enabled(True)
     train_ds = model.on_train_start(train_ds)
+    if model.gpu_id == 0:
+        _print_batch(train_ds, valid_ds, tokenizer)
 
-    # optimizer, schedule_dict = model.configure_optimizers()
     optimizer, sched_dict = model.configure_optimizers()
     scheduler = sched_dict.get("scheduler", None)  # interval='step' in your config
 
-    for ei in range(config.trainer.max_steps):
+    for ei in range(model.epochs_run, config.trainer.max_steps):
         losses = []
 
         for idx, batch in enumerate(train_ds):
             if (idx + 1) % config.trainer.log_every_n_steps == 0:
                 arr = torch.tensor(losses)
-                print(
-                    f"GPU: {model.gpu_id}, Training epoch {ei}, batch {idx + 1}/{len(train_ds)}, loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}",
-                    end="\n", flush=True)
+                if model.gpu_id == 0:
+                    logger.info(
+                        f"GPU: {model.gpu_id}, epoch {ei}, batch {idx + 1}/{len(train_ds)}, loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
                 # sys.stdout.flush()
             # Move batch tensors to the correct device
-            # for k, v in batch.items():
-            #     if isinstance(v, torch.Tensor):
-            #         batch[k] = v.to(device, non_blocking=True)
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(model.gpu_id, non_blocking=True)
 
             # train step
             loss = model.training_step(batch)
@@ -234,17 +229,20 @@ def _train(config, logger, tokenizer):
             losses.append(loss.detach())
 
             if (idx + 1) % config.trainer.val_check_interval == 0:
-                print("Validation step...")
+                if model.gpu_id == 0:
+                    logger.info("Validation step...")
                 model.on_validation_epoch_start()
                 val_losses = []
                 for val_batch in tqdm.tqdm(valid_ds):
                     for k, v in val_batch.items():
                         if isinstance(v, torch.Tensor):
-                            val_batch[k] = v.to(device, non_blocking=True)
+                            val_batch[k] = v.to(model.gpu_id, non_blocking=True)
                     val_loss = model.validation_step(val_batch)
                     val_losses.append(val_loss.detach())
                     model.logger.log({"val_loss": val_loss})
-                print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+                arr = torch.tensor(val_losses)
+                if model.gpu_id == 0:
+                    print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
                 model.on_validation_epoch_end()
 
             if config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
@@ -257,7 +255,10 @@ def _train(config, logger, tokenizer):
 def main(config):
     """Main entry point for training."""
     utils.seed_everything(config.seed)
-    _print_config(config, resolve=True, save_cfg=True)
+
+    # Only print config on GPU 0 (main process) in DDP setting
+    if not os.environ.get("LOCAL_RANK") or int(os.environ["LOCAL_RANK"]) == 0:
+        _print_config(config, resolve=True, save_cfg=True)
 
     logger = utils.get_logger(__name__)
     tokenizer = dataloader.get_tokenizer(config)
@@ -267,9 +268,6 @@ def main(config):
     elif config.mode == 'ppl_eval':
         _ppl_eval(config, logger, tokenizer)
     else:
-        # world_size = torch.cuda.device_count()
-        # mp.spawn(_train, args=(world_size, logger, tokenizer), nprocs=world_size)
-
         _train(config, logger, tokenizer)
 
 

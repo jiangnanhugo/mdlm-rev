@@ -8,7 +8,6 @@ import hydra.utils
 # import lightning as L
 import numpy as np
 import torch
-from torch import nn
 import torch.nn.functional as F
 import torchmetrics
 import transformers
@@ -26,9 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def _sample_categorical(categorical_probs):
-    gumbel_norm = (
-            1e-10
-            - (torch.rand_like(categorical_probs) + 1e-10).log())
+    gumbel_norm = (1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log())
     return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
 
@@ -119,7 +116,9 @@ class Diffusion:
 
         ## BEGIN: add support for DDP
         self.backbone = self.backbone.to(self.gpu_id)
+
         self.backbone = DDP(self.backbone, device_ids=[self.gpu_id])
+        self.epochs_run = 0
         self.save_every = save_every
         if os.path.exists(snapshot_path):
             print("Loading snapshot")
@@ -141,15 +140,23 @@ class Diffusion:
         self.valid_metrics = metrics.clone(prefix='val/')
         self.test_metrics = metrics.clone(prefix='test/')
 
+        ## BEGIN: add support for DDP
+        self.train_metrics = self.train_metrics.to(self.gpu_id)
+        self.valid_metrics = self.valid_metrics.to(self.gpu_id)
+        self.test_metrics = self.test_metrics.to(self.gpu_id)
+        ## END: add support for DDP
+
         # generative perplexity
         self.gen_ppl_metric = Perplexity()
-        self.eval_model_tokenizer = transformers.AutoTokenizer. \
-            from_pretrained(self.gen_ppl_eval_model_name_or_path)
+        self.eval_model_tokenizer = transformers.AutoTokenizer.from_pretrained(self.gen_ppl_eval_model_name_or_path)
         if self.eval_model_tokenizer.pad_token is None:
             self.eval_model_tokenizer.pad_token = self.eval_model_tokenizer.eos_token
             self.eval_model_tokenizer.pad_token_id = self.eval_model_tokenizer.eos_token_id
 
         self.noise = noise_schedule.get_noise(self.config, dtype=self.dtype)
+        ### BEGIN: add support for DDP
+        self.noise = self.noise.to(self.gpu_id)
+        ### END: add support for DDP
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
                 itertools.chain(self.backbone.parameters(),
@@ -185,9 +192,7 @@ class Diffusion:
         # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
         self.fast_forward_epochs = checkpoint['loops'][
             'fit_loop']['epoch_progress']['current']['completed']
-        self.fast_forward_batches = checkpoint['loops'][
-            'fit_loop']['epoch_loop.batch_progress'][
-            'current']['completed']
+        self.fast_forward_batches = checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['completed']
 
     def _save_snapshot(self, epoch):
         snapshot = {
@@ -206,13 +211,13 @@ class Diffusion:
         # behind, so we're using the optimizer's progress.
         checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['completed'] = \
             checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step'][
-                'total']['completed'] * self.trainer.accumulate_grad_batches
+                'total']['completed'] * self.accumulate_grad_batches
         checkpoint['loops']['fit_loop'][
             'epoch_loop.batch_progress']['current'][
             'completed'] = checkpoint['loops']['fit_loop'][
                                'epoch_loop.automatic_optimization.optim_progress'][
                                'optimizer']['step']['current'][
-                               'completed'] * self.trainer.accumulate_grad_batches
+                               'completed'] * self.accumulate_grad_batches
         # _batches_that_stepped tracks the number of global steps, not the number
         # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
         checkpoint['loops']['fit_loop'][
@@ -222,10 +227,9 @@ class Diffusion:
             'optimizer']['step']['total']['completed']
         if 'sampler' not in checkpoint.keys():
             checkpoint['sampler'] = {}
-        if hasattr(self.trainer.train_dataloader.sampler,
+        if hasattr(self.train_dataloader.sampler,
                    'state_dict'):
-            sampler_state_dict = self.trainer. \
-                train_dataloader.sampler.state_dict()
+            sampler_state_dict = self.train_dataloader.sampler.state_dict()
             checkpoint['sampler'][
                 'random_state'] = sampler_state_dict.get(
                 'random_state', None)
@@ -251,7 +255,8 @@ class Diffusion:
 
         if distributed:
             sampler_cls = dataloader.FaultTolerantDistributedSampler
-            print("use distributed sampler: FaultTolerantDistributedSampler")
+            if self.gpu_id == 0:
+                print("use distributed sampler: FaultTolerantDistributedSampler")
         else:
             sampler_cls = dataloader.RandomFaultTolerantSampler
             print("use random sampler: RandomFaultTolerantSampler")
@@ -471,18 +476,16 @@ class Diffusion:
                     self.compute_generative_perplexity(text_samples)
             if hasattr(self.logger, 'log_table'):  # self.trainer.global_rank == 0 and
                 # Log the last generated samples
-                text_samples = text_samples[
-                    : self.config.sampling.num_sample_log]
+                text_samples = text_samples[: self.config.sampling.num_sample_log]
                 self.logger.log_table(
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
             if self.config.eval.compute_generative_perplexity:
                 self.logger.log({'val/gen_ppl': self.gen_ppl_metric})
+
         if self.ema:
-            self.ema.restore(
-                itertools.chain(self.backbone.parameters(),
-                                self.noise.parameters()))
+            self.ema.restore(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
 
     def optimizer_step(self, optimizer, scheduler):
         optimizer.step()
@@ -621,14 +624,12 @@ class Diffusion:
               diffusion_model_input_length), input.
           move_chance: float torch.Tensor with shape (batch_size, 1).
         """
-        move_indices = torch.rand(
-            *x.shape, device=x.device) < move_chance
+        move_indices = torch.rand(*x.shape, device=x.device) < move_chance
         xt = torch.where(move_indices, self.mask_index, x)
         return xt
 
     def _sample_prior(self, *batch_dims):
-        return self.mask_index * torch.ones(
-            *batch_dims, dtype=torch.int64)
+        return self.mask_index * torch.ones(*batch_dims, dtype=torch.int64)
 
     def _ddpm_caching_update(self, x, t, dt, p_x0=None):
         assert self.config.noise.type == 'loglinear'
@@ -742,19 +743,13 @@ class Diffusion:
         """Generate samples from the model."""
         # Lightning auto-casting is not working in this method for some reason
         if self.ema:
-            self.ema.store(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
-            self.ema.copy_to(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.store(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
+            self.ema.copy_to(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
         self.backbone.eval()
         self.noise.eval()
         samples = self._sample(num_steps=num_steps, eps=eps)
         if self.ema:
-            self.ema.restore(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.restore(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
         self.backbone.train()
         self.noise.train()
         return samples
@@ -996,10 +991,8 @@ class Diffusion:
         return entropy
 
     @torch.no_grad
-    def sample_subs_guidance(
-            self, n_samples, stride_length, num_strides, dt=0.001):
-        ones = torch.ones(n_samples, dtype=self.dtype,
-                          device=self.device)
+    def sample_subs_guidance(self, n_samples, stride_length, num_strides, dt=0.001):
+        ones = torch.ones(n_samples, dtype=self.dtype, device=self.device)
 
         num_steps = int(1 / dt)
         sampling_steps = 0
@@ -1042,12 +1035,8 @@ class Diffusion:
         """Generate samples from the model."""
         # Lightning auto-casting is not working in this method for some reason
         if self.ema:
-            self.ema.store(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
-            self.ema.copy_to(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.store(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
+            self.ema.copy_to(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
         self.backbone.eval()
         self.noise.eval()
         (sampling_steps, samples,
@@ -1057,9 +1046,7 @@ class Diffusion:
             num_strides=num_strides,
             dt=dt)
         if self.ema:
-            self.ema.restore(itertools.chain(
-                self.backbone.parameters(),
-                self.noise.parameters()))
+            self.ema.restore(itertools.chain(self.backbone.parameters(), self.noise.parameters()))
         self.backbone.train()
         self.noise.train()
         return sampling_steps, samples, sequence_lengths
