@@ -216,16 +216,22 @@ def _train(config, logger, tokenizer):
     optimizer, sched_dict = model.configure_optimizers()
     scheduler = sched_dict.get("scheduler", None)  # interval='step' in your config
 
-    g_idx = 0
-    for ei in range(model.epochs_run, config.trainer.max_steps):
+    g_idx = model.epochs_run
+    # for ei in range(model.epochs_run, config.trainer.max_steps):
+    ei=0
+    while True:
         losses = []
 
         for idx, batch in enumerate(train_ds):
+            g_idx += 1
+            if g_idx >=config.trainer.max_steps:
+                break
+            
             if (g_idx + 1) % config.trainer.log_every_n_steps == 0:
                 arr = torch.tensor(losses)
                 if model.gpu_id == 0:
                     logger.info(
-                        f"GPU: {model.gpu_id}, epoch {ei}, batch {idx + 1}/{len(train_ds)}, loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+                        f"[GPU{model.gpu_id}] gidx {g_idx}, epoch {ei}, idx {idx + 1}/{len(train_ds)}, loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
                 # sys.stdout.flush()
             # Move batch tensors to the correct device
             for k, v in batch.items():
@@ -245,7 +251,7 @@ def _train(config, logger, tokenizer):
             model.optimizer_step(optimizer, scheduler)
 
             losses.append(loss.detach())
-            g_idx += 1
+            
             if (g_idx + 1) % config.trainer.val_check_interval == 0:
                 with torch.no_grad():
                     if model.gpu_id == 0:
@@ -267,6 +273,7 @@ def _train(config, logger, tokenizer):
             if (g_idx + 1) % config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
                 model.save_checkpoint(ckpt_path=ckpt_path, epoch=g_idx)
                 logger.info(f"Checkpoint saved at {ckpt_path}")
+        ei+=1
 
     destroy_process_group()
 

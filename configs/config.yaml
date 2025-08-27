@@ -45,7 +45,7 @@ training:
   change_of_variables: False
 
 eval:
-  checkpoint_path: '/scratch'  # Used to evaluate a checkpoint after training.
+  checkpoint_path: '/media/jiangnan/scratch/data'  # Used to evaluate a checkpoint after training.
   disable_ema: False
   compute_generative_perplexity: False
   perplexity_batch_size: 8
