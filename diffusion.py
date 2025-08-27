@@ -71,12 +71,16 @@ class Diffusion:
             self,
             config,
             tokenizer: transformers.PreTrainedTokenizer,
-            save_every: int,
-            snapshot_path: str,
-            dtype=torch.bfloat16, ):
+            save_every: int=10,
+            snapshot_path: str="/scratch",
+            dtype=torch.bfloat16,
+            gpu_id='ddp'):
         # super().__init__()
         self.dtype = dtype
-        self.gpu_id = int(os.environ["LOCAL_RANK"])
+        if gpu_id=='ddp':
+            self.gpu_id = int(os.environ["LOCAL_RANK"])
+        else:
+            self.gpu_id = gpu_id
 
         self.config = config
 
@@ -116,8 +120,8 @@ class Diffusion:
 
         ## BEGIN: add support for DDP
         self.backbone = self.backbone.to(self.gpu_id)
-
-        self.backbone = DDP(self.backbone, device_ids=[self.gpu_id])
+        if gpu_id=='ddp':
+            self.backbone = DDP(self.backbone, device_ids=[self.gpu_id])
         self.epochs_run = 0
         self.save_every = save_every
         if os.path.exists(snapshot_path):
@@ -159,8 +163,7 @@ class Diffusion:
         ### END: add support for DDP
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
-                itertools.chain(self.backbone.parameters(),
-                                self.noise.parameters()),
+                itertools.chain(self.backbone.parameters(), self.noise.parameters()),
                 decay=self.config.training.ema)
         else:
             self.ema = None
@@ -185,56 +188,64 @@ class Diffusion:
         if self.subs_masking:
             assert self.parameterization == 'd3pm'
 
-    def on_load_checkpoint(self, checkpoint):
-        if self.ema:
-            self.ema.load_state_dict(checkpoint['ema'])
-        # Copied from:
-        # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-        self.fast_forward_epochs = checkpoint['loops'][
-            'fit_loop']['epoch_progress']['current']['completed']
-        self.fast_forward_batches = checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['completed']
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path, tokenizer, config, gpu_id):
+        temp = cls(config, tokenizer=tokenizer, gpu_id=gpu_id)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if gpu_id=='ddp':
+            temp.backbone.module.load_state_dict(checkpoint['backbone'])
+        else:
+            temp.backbone.load_state_dict(checkpoint['backbone'])
+        temp.noise.load_state_dict(checkpoint['noise'])
 
-    def _save_snapshot(self, epoch):
-        snapshot = {
-            "MODEL_STATE": self.backbone.module.state_dict(),
+        if temp.ema and 'ema' in checkpoint:
+            temp.ema.load_state_dict(checkpoint['ema'])
+        if 'EPOCHS_RUN' in checkpoint:
+            temp.epochs_run = checkpoint['EPOCHS_RUN']
+            print(f"Resuming from epoch {temp.epochs_run}")
+        else:
+            print("No epoch information found in checkpoint.")
+        print(f"Loaded model weights from {checkpoint_path}")
+        return temp
+
+
+    def save_checkpoint(self, ckpt_path: str, epoch: int):
+        checkpoint = {
+            "tokenizer": self.tokenizer,
+            "config": self.config,
+            "backbone": self.backbone.module.state_dict(),
+            "noise": self.noise.state_dict(),
             "EPOCHS_RUN": epoch,
         }
-        torch.save(snapshot, self.snapshot_path)
-        print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
-
-    def on_save_checkpoint(self, checkpoint):
         if self.ema:
             checkpoint['ema'] = self.ema.state_dict()
-        # Copied from:
-        # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-        # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
-        # behind, so we're using the optimizer's progress.
-        checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['completed'] = \
-            checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step'][
-                'total']['completed'] * self.accumulate_grad_batches
-        checkpoint['loops']['fit_loop'][
-            'epoch_loop.batch_progress']['current'][
-            'completed'] = checkpoint['loops']['fit_loop'][
-                               'epoch_loop.automatic_optimization.optim_progress'][
-                               'optimizer']['step']['current'][
-                               'completed'] * self.accumulate_grad_batches
-        # _batches_that_stepped tracks the number of global steps, not the number
-        # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-        checkpoint['loops']['fit_loop'][
-            'epoch_loop.state_dict'][
-            '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
-            'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total']['completed']
-        if 'sampler' not in checkpoint.keys():
-            checkpoint['sampler'] = {}
-        if hasattr(self.train_dataloader.sampler,
-                   'state_dict'):
-            sampler_state_dict = self.train_dataloader.sampler.state_dict()
-            checkpoint['sampler'][
-                'random_state'] = sampler_state_dict.get(
-                'random_state', None)
-        else:
-            checkpoint['sampler']['random_state'] = None
+
+        torch.save(checkpoint, ckpt_path + "-epoch{}.pt".format(epoch))
+        print(f"Epoch {epoch} | Training snapshot saved at {ckpt_path}")
+
+    # def on_save_checkpoint(self, checkpoint):
+
+    # Copied from:
+    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
+    # used for accumulate_grad_batches
+    # checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['completed'] = \
+    #     checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['total']['completed'] * self.accumulate_grad_batches
+    #
+    # checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['completed'] = \
+    #     checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['current']['completed'] * self.accumulate_grad_batches
+
+    # _batches_that_stepped tracks the number of global steps, not the number
+    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
+    # checkpoint['loops']['fit_loop']['epoch_loop.state_dict']['_batches_that_stepped'] = checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['total']['completed']
+
+    #  Training dataloaders may use a sampler (e.g., DistributedSampler, RandomSampler) that shuffles data deterministically using a random seed/state.
+    # if 'sampler' not in checkpoint.keys():
+    #     checkpoint['sampler'] = {}
+    # if hasattr(self.train_dataloader.sampler, 'state_dict'):
+    #     sampler_state_dict = self.train_dataloader.sampler.state_dict()
+    #     checkpoint['sampler']['random_state'] = sampler_state_dict.get('random_state', None)
+    # else:
+    #     checkpoint['sampler']['random_state'] = None
 
     def on_train_start(self, train_dl):
 
@@ -320,8 +331,7 @@ class Diffusion:
 
         # Normalize the logits such that x.exp() is
         # a probability distribution over vocab_size.
-        logits = logits - torch.logsumexp(logits, dim=-1,
-                                          keepdim=True)
+        logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
 
         # Apply updates directly in the logits matrix.
         # For the logits of the unmasked tokens, set all values
@@ -443,7 +453,7 @@ class Diffusion:
 
     def training_step(self, batch, batch_idx=None):
         loss = self._compute_loss(batch, prefix='train')
-        # self.logger.log()
+
         self.logger.log({'trainer/loss': loss.item()})
         return loss
 
@@ -1030,8 +1040,7 @@ class Diffusion:
         return (sampling_steps, intermediate_text_samples,
                 sequence_lengths)
 
-    def restore_model_and_semi_ar_sample(
-            self, stride_length, num_strides, dt=0.001):
+    def restore_model_and_semi_ar_sample(self, stride_length, num_strides, dt=0.001):
         """Generate samples from the model."""
         # Lightning auto-casting is not working in this method for some reason
         if self.ema:

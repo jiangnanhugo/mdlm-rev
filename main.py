@@ -28,13 +28,11 @@ def ddp_setup():
 
 def _load_from_checkpoint(config, tokenizer):
     if 'hf' in config.backbone:
-        return diffusion.Diffusion(
-            config, tokenizer=tokenizer).to('cuda')
+        return diffusion.Diffusion(config, tokenizer=tokenizer)
 
-    return diffusion.Diffusion.load_from_checkpoint(
-        config.eval.checkpoint_path,
-        tokenizer=tokenizer,
-        config=config)
+    return diffusion.Diffusion.load_from_checkpoint(config.eval.checkpoint_path,
+                                                    tokenizer=tokenizer,
+                                                    config=config, gpu_id='cuda:1')
 
 
 # @L.pytorch.utilities.rank_zero_only
@@ -98,12 +96,14 @@ def generate_samples(config, logger, tokenizer):
         model.ema = None
     stride_length = config.sampling.stride_length
     num_strides = config.sampling.num_strides
+
     for _ in range(config.sampling.num_sample_batches):
         if config.sampling.semi_ar:
             _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
                 stride_length=stride_length,
                 num_strides=num_strides,
                 dt=1 / config.sampling.steps)
+
             text_samples = intermediate_samples[-1]
             # Note: Samples generated using semi-ar method
             # need to to be processed before computing generative perplexity
@@ -114,10 +114,10 @@ def generate_samples(config, logger, tokenizer):
             samples = model.restore_model_and_sample(num_steps=config.sampling.steps)
             text_samples = model.tokenizer.batch_decode(samples)
             model.compute_generative_perplexity(text_samples)
+
     print('Text samples:', text_samples)
     if not config.sampling.semi_ar:
-        print('Generative perplexity:',
-              model.gen_ppl_metric.compute())
+        print('Generative perplexity:', model.gen_ppl_metric.compute())
     return text_samples
 
 
@@ -125,6 +125,7 @@ def _ppl_eval(config, logger, tokenizer):
     logger.info('Starting Zero Shot Eval.')
 
     model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+
     if config.eval.disable_ema:
         logger.info('Disabling EMA.')
         model.ema = None
@@ -136,24 +137,39 @@ def _ppl_eval(config, logger, tokenizer):
         #     **config.wandb)
         import wandb
         wandb_config = omegaconf.OmegaConf.to_container(config, resolve=True)
+        # Check offline flag from config.wandb
+        offline_mode = bool(config.wandb.get("offline", False))
         wandb_logger = wandb.init(
             project=config.wandb.get("project", "default_project"),
             config=wandb_config,
-            **{k: v for k, v in config.wandb.items() if k != "project"}
+            mode="offline" if offline_mode else "online",
+            **{k: v for k, v in config.wandb.items() if k not in ["project", "offline"]}
         )
+    model.logger = wandb_logger
     callbacks = []
     if 'callbacks' in config:
         for _, callback in config.callbacks.items():
             callbacks.append(hydra.utils.instantiate(callback))
-    trainer = hydra.utils.instantiate(
-        config.trainer,
-        default_root_dir=os.getcwd(),
-        callbacks=callbacks,
-        strategy=hydra.utils.instantiate(config.strategy),
-        logger=wandb_logger)
+
+
     _, valid_ds = dataloader.get_dataloaders(
         config, tokenizer, skip_train=True, valid_seed=config.seed)
-    trainer.validate(model, valid_ds)
+
+    model.on_validation_epoch_start()
+    val_losses = []
+    # for val_batch in tqdm.tqdm(valid_ds):
+    for val_batch in valid_ds:
+        # print(val_batch)
+        for k, v in val_batch.items():
+            if isinstance(v, torch.Tensor):
+                val_batch[k] = v.to(model.gpu_id, non_blocking=True)
+        val_loss = model.validation_step(val_batch)
+        val_losses.append(val_loss.detach())
+        print(val_loss)
+        model.logger.log({"val_loss": val_loss})
+    arr = torch.tensor(val_losses)
+    print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+    model.on_validation_epoch_end()
 
 
 def _train(config, logger, tokenizer):
@@ -174,7 +190,7 @@ def _train(config, logger, tokenizer):
                 config.checkpointing.resume_ckpt_path)):
         ckpt_path = config.checkpointing.resume_ckpt_path
     else:
-        ckpt_path = None
+        ckpt_path = config.callbacks.checkpoint_every_n_steps.dirpath
 
     # callbacks
     callbacks = []
@@ -199,11 +215,12 @@ def _train(config, logger, tokenizer):
     optimizer, sched_dict = model.configure_optimizers()
     scheduler = sched_dict.get("scheduler", None)  # interval='step' in your config
 
+    g_idx = 0
     for ei in range(model.epochs_run, config.trainer.max_steps):
         losses = []
 
         for idx, batch in enumerate(train_ds):
-            if (idx + 1) % config.trainer.log_every_n_steps == 0:
+            if (g_idx + 1) % config.trainer.log_every_n_steps == 0:
                 arr = torch.tensor(losses)
                 if model.gpu_id == 0:
                     logger.info(
@@ -227,8 +244,8 @@ def _train(config, logger, tokenizer):
             model.optimizer_step(optimizer, scheduler)
 
             losses.append(loss.detach())
-
-            if (idx + 1) % config.trainer.val_check_interval == 0:
+            g_idx += 1
+            if (g_idx + 1) % config.trainer.val_check_interval == 0:
                 if model.gpu_id == 0:
                     logger.info("Validation step...")
                 model.on_validation_epoch_start()
@@ -245,8 +262,9 @@ def _train(config, logger, tokenizer):
                     print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
                 model.on_validation_epoch_end()
 
-            if config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
-                model.on_save_checkpoint(ckpt_path=ckpt_path)
+            if (g_idx + 1) % config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
+                model.save_checkpoint(ckpt_path=ckpt_path, epoch=g_idx)
+                logger.info(f"Checkpoint saved at {ckpt_path}")
 
     destroy_process_group()
 
