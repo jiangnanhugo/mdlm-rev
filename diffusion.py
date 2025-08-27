@@ -71,13 +71,13 @@ class Diffusion:
             self,
             config,
             tokenizer: transformers.PreTrainedTokenizer,
-            save_every: int=10,
-            snapshot_path: str="/scratch",
+            save_every: int = 10,
+            snapshot_path: str = "/scratch",
             dtype=torch.bfloat16,
             gpu_id='ddp'):
         # super().__init__()
         self.dtype = dtype
-        if gpu_id=='ddp':
+        if gpu_id == 'ddp':
             self.gpu_id = int(os.environ["LOCAL_RANK"])
         else:
             self.gpu_id = gpu_id
@@ -91,6 +91,7 @@ class Diffusion:
         self.antithetic_sampling = self.config.training.antithetic_sampling
         self.importance_sampling = self.config.training.importance_sampling
         self.change_of_variables = self.config.training.change_of_variables
+
         if (not hasattr(self.tokenizer, 'mask_token')
                 or self.tokenizer.mask_token is None):
             self.mask_index = self.vocab_size
@@ -120,7 +121,7 @@ class Diffusion:
 
         ## BEGIN: add support for DDP
         self.backbone = self.backbone.to(self.gpu_id)
-        if gpu_id=='ddp':
+        if gpu_id == 'ddp':
             self.backbone = DDP(self.backbone, device_ids=[self.gpu_id])
         self.epochs_run = 0
         self.save_every = save_every
@@ -160,6 +161,7 @@ class Diffusion:
         self.noise = noise_schedule.get_noise(self.config, dtype=self.dtype)
         ### BEGIN: add support for DDP
         self.noise = self.noise.to(self.gpu_id)
+        self.gen_ppl_metric = self.gen_ppl_metric.to(self.gpu_id)
         ### END: add support for DDP
         if self.config.training.ema > 0:
             self.ema = models.ema.ExponentialMovingAverage(
@@ -191,8 +193,8 @@ class Diffusion:
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path, tokenizer, config, gpu_id):
         temp = cls(config, tokenizer=tokenizer, gpu_id=gpu_id)
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        if gpu_id=='ddp':
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        if gpu_id == 'ddp':
             temp.backbone.module.load_state_dict(checkpoint['backbone'])
         else:
             temp.backbone.load_state_dict(checkpoint['backbone'])
@@ -208,7 +210,6 @@ class Diffusion:
         print(f"Loaded model weights from {checkpoint_path}")
         return temp
 
-
     def save_checkpoint(self, ckpt_path: str, epoch: int):
         checkpoint = {
             "tokenizer": self.tokenizer,
@@ -221,31 +222,7 @@ class Diffusion:
             checkpoint['ema'] = self.ema.state_dict()
 
         torch.save(checkpoint, ckpt_path + "-epoch{}.pt".format(epoch))
-        print(f"Epoch {epoch} | Training snapshot saved at {ckpt_path}")
-
-    # def on_save_checkpoint(self, checkpoint):
-
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-    # used for accumulate_grad_batches
-    # checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['total']['completed'] = \
-    #     checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['total']['completed'] * self.accumulate_grad_batches
-    #
-    # checkpoint['loops']['fit_loop']['epoch_loop.batch_progress']['current']['completed'] = \
-    #     checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['current']['completed'] * self.accumulate_grad_batches
-
-    # _batches_that_stepped tracks the number of global steps, not the number
-    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-    # checkpoint['loops']['fit_loop']['epoch_loop.state_dict']['_batches_that_stepped'] = checkpoint['loops']['fit_loop']['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step']['total']['completed']
-
-    #  Training dataloaders may use a sampler (e.g., DistributedSampler, RandomSampler) that shuffles data deterministically using a random seed/state.
-    # if 'sampler' not in checkpoint.keys():
-    #     checkpoint['sampler'] = {}
-    # if hasattr(self.train_dataloader.sampler, 'state_dict'):
-    #     sampler_state_dict = self.train_dataloader.sampler.state_dict()
-    #     checkpoint['sampler']['random_state'] = sampler_state_dict.get('random_state', None)
-    # else:
-    #     checkpoint['sampler']['random_state'] = None
+        print(f"Epoch {epoch} | Training snapshot saved at {ckpt_path}" + "-epoch{}.pt".format(epoch))
 
     def on_train_start(self, train_dl):
 
@@ -444,10 +421,6 @@ class Diffusion:
         else:
             raise ValueError(f'Invalid prefix: {prefix}')
 
-        # self.log_dict(metrics,
-        #               on_step=False,
-        #               on_epoch=True,
-        #               sync_dist=True)
         self.logger.log({'metrics': metrics})
         return loss
 
@@ -561,8 +534,8 @@ class Diffusion:
         attn_mask = samples['attention_mask']
         samples = samples['input_ids']
         if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-            attn_mask = attn_mask.to(self.device)
-            samples = samples.to(self.device)
+            attn_mask = attn_mask.to(self.gpu_id)
+            samples = samples.to(self.gpu_id)
         return samples, attn_mask, eval_context_size
 
     @torch.no_grad()
@@ -586,7 +559,7 @@ class Diffusion:
         if max_length is None:
             max_length = self.config.model.length
         if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-            eval_model = eval_model.to(self.device)
+            eval_model = eval_model.to(self.gpu_id)
         # Re-tokenize using eval model's tokenizer
         if retokenize:
             (samples, attn_mask,
@@ -594,23 +567,23 @@ class Diffusion:
                 text_samples, max_length=max_length)
         else:
             samples = text_samples
-            attn_mask = torch.ones(samples.shape).to(self.device)
+            attn_mask = torch.ones(samples.shape).to(self.gpu_id)
             eval_context_size = samples.shape[-1]
+
         batch_size = min(
             self.config.eval.perplexity_batch_size,
             samples.shape[0])
         num_batches = samples.shape[0] // batch_size
+
         for i in range(num_batches):
-            _samples = torch.split(
-                samples[i * batch_size: (i + 1) * batch_size],
-                eval_context_size,
-                dim=-1)
+            _samples = torch.split(samples[i * batch_size: (i + 1) * batch_size],
+                                   eval_context_size,
+                                   dim=-1)
             _attn_mask = torch.split(
                 attn_mask[i * batch_size: (i + 1) * batch_size],
                 eval_context_size,
                 dim=-1)
-            for (sample_chunk, attn_mask_chunk) in zip(
-                    _samples, _attn_mask):
+            for (sample_chunk, attn_mask_chunk) in zip(_samples, _attn_mask):
                 logits = eval_model(
                     sample_chunk, attention_mask=attn_mask_chunk)[0]
                 logits = logits.transpose(-1, -2)
@@ -618,13 +591,10 @@ class Diffusion:
                 nlls = F.cross_entropy(logits[..., :-1],
                                        sample_chunk[..., 1:],
                                        reduction='none')
-                first_eos = (sample_chunk == self.eval_model_tokenizer \
-                             .eos_token_id).cumsum(-1) == 1
-                token_mask = (
-                        sample_chunk
-                        != self.eval_model_tokenizer.eos_token_id)
-                self.gen_ppl_metric.update(
-                    nlls, first_eos[..., 1:] + token_mask[..., 1:])
+                first_eos = (sample_chunk == self.eval_model_tokenizer.eos_token_id).cumsum(-1) == 1
+                token_mask = (sample_chunk != self.eval_model_tokenizer.eos_token_id)
+                self.gen_ppl_metric.update(nlls,
+                                           first_eos[..., 1:] + token_mask[..., 1:])
 
     def q_xt(self, x, move_chance):
         """Computes the noisy sample xt.
@@ -694,12 +664,12 @@ class Diffusion:
         x = torch.zeros(
             (bsz, num_pred_tokens + 1),
             dtype=torch.long,
-            device=self.device)
+            device=self.gpu_id)
         x[:, 0] = self.tokenizer.bos_token_id
         # precompute noise
         noise = (torch.distributions.Gumbel(0, 1)
                  .sample((bsz, num_pred_tokens, self.vocab_size))
-                 .to(self.device))
+                 .to(self.gpu_id))
         for i in range(num_pred_tokens):
             next_logits = self.forward(x[:, :i + 1], None)[:, -1]
             y = (next_logits + noise[:, i]).argmax(-1)
@@ -717,15 +687,15 @@ class Diffusion:
             num_steps = self.config.sampling.steps
         x = self._sample_prior(
             batch_size_per_gpu,
-            self.config.model.length).to(self.device)
+            self.config.model.length).to(self.gpu_id)
         timesteps = torch.linspace(
-            1, eps, num_steps + 1, device=self.device)
+            1, eps, num_steps + 1, device=self.gpu_id)
         dt = (1 - eps) / num_steps
         p_x0_cache = None
 
         for i in range(num_steps):
             t = timesteps[i] * torch.ones(
-                x.shape[0], 1, device=self.device)
+                x.shape[0], 1, device=self.gpu_id)
             if self.sampler == 'ddpm':
                 x = self._ddpm_update(x, t, dt)
             elif self.sampler == 'ddpm_cache':
@@ -741,7 +711,7 @@ class Diffusion:
 
         if self.config.sampling.noise_removal:
             t = timesteps[-1] * torch.ones(x.shape[0], 1,
-                                           device=self.device)
+                                           device=self.gpu_id)
             if self.sampler == 'analytic':
                 x = self._denoiser_update(x, t)
             else:
@@ -880,8 +850,7 @@ class Diffusion:
         return input_tokens, output_tokens, new_attention_mask
 
     def _reconstruction_loss(self, x0):
-        t0 = torch.zeros(x0.shape[0], dtype=self.dtype,
-                         device=self.device)
+        t0 = torch.zeros(x0.shape[0], dtype=self.dtype, device=self.gpu_id)
         assert self.config.noise.type == 'loglinear'
         # The above assert is for d3pm parameterization
         unet_conditioning = self.noise(t0)[0][:, None]
@@ -1002,7 +971,7 @@ class Diffusion:
 
     @torch.no_grad
     def sample_subs_guidance(self, n_samples, stride_length, num_strides, dt=0.001):
-        ones = torch.ones(n_samples, dtype=self.dtype, device=self.device)
+        ones = torch.ones(n_samples, dtype=self.dtype, device=self.gpu_id)
 
         num_steps = int(1 / dt)
         sampling_steps = 0
@@ -1012,7 +981,7 @@ class Diffusion:
             p_x0_cache = None
             x = self._sample_prior(
                 n_samples,
-                self.config.model.length).to(self.device)
+                self.config.model.length).to(self.gpu_id)
             if target is not None:
                 x[:, : -stride_length] = target
             for i in range(num_steps + 1):

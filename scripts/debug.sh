@@ -12,12 +12,12 @@
 
 
 torchrun --standalone --nproc_per_node=2 -m main \
-  loader.batch_size=4 \
-  loader.eval_batch_size=4 \
+  loader.batch_size=32 \
+  loader.eval_batch_size=32 \
   model=small \
   data=wikitext2 \
   wandb.name=mdlm-wiki2 \
   parameterization=subs \
-  model.length=32 \
+  model.length=100 \
   eval.compute_generative_perplexity=True \
   sampling.steps=99

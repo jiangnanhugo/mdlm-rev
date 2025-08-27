@@ -67,9 +67,8 @@ def _print_config(
         branch.add(rich.syntax.Syntax(branch_content, 'yaml'))
     rich.print(tree)
     if save_cfg:
-        with fsspec.open(
-                '{}/config_tree.txt'.format(
-                    config.checkpointing.save_dir), 'w') as fp:
+        filename='{}/config_tree.txt'.format(config.checkpointing.save_dir)
+        with fsspec.open(filename, 'w') as fp:
             rich.print(tree, file=fp)
 
 
@@ -113,6 +112,8 @@ def generate_samples(config, logger, tokenizer):
         else:
             samples = model.restore_model_and_sample(num_steps=config.sampling.steps)
             text_samples = model.tokenizer.batch_decode(samples)
+
+            print(text_samples)
             model.compute_generative_perplexity(text_samples)
 
     print('Text samples:', text_samples)
@@ -154,22 +155,22 @@ def _ppl_eval(config, logger, tokenizer):
 
     _, valid_ds = dataloader.get_dataloaders(
         config, tokenizer, skip_train=True, valid_seed=config.seed)
-
-    model.on_validation_epoch_start()
-    val_losses = []
-    # for val_batch in tqdm.tqdm(valid_ds):
-    for val_batch in valid_ds:
-        # print(val_batch)
-        for k, v in val_batch.items():
-            if isinstance(v, torch.Tensor):
-                val_batch[k] = v.to(model.gpu_id, non_blocking=True)
-        val_loss = model.validation_step(val_batch)
-        val_losses.append(val_loss.detach())
-        print(val_loss)
-        model.logger.log({"val_loss": val_loss})
-    arr = torch.tensor(val_losses)
-    print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
-    model.on_validation_epoch_end()
+    with torch.no_grad():
+        model.on_validation_epoch_start()
+        val_losses = []
+        # for val_batch in tqdm.tqdm(valid_ds):
+        for val_batch in valid_ds:
+            # print(val_batch)
+            for k, v in val_batch.items():
+                if isinstance(v, torch.Tensor):
+                    val_batch[k] = v.to(model.gpu_id, non_blocking=True)
+            val_loss = model.validation_step(val_batch)
+            val_losses.append(val_loss.detach())
+            print(val_loss)
+            model.logger.log({"val_loss": val_loss})
+        arr = torch.tensor(val_losses)
+        print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+        model.on_validation_epoch_end()
 
 
 def _train(config, logger, tokenizer):
@@ -246,21 +247,22 @@ def _train(config, logger, tokenizer):
             losses.append(loss.detach())
             g_idx += 1
             if (g_idx + 1) % config.trainer.val_check_interval == 0:
-                if model.gpu_id == 0:
-                    logger.info("Validation step...")
-                model.on_validation_epoch_start()
-                val_losses = []
-                for val_batch in tqdm.tqdm(valid_ds):
-                    for k, v in val_batch.items():
-                        if isinstance(v, torch.Tensor):
-                            val_batch[k] = v.to(model.gpu_id, non_blocking=True)
-                    val_loss = model.validation_step(val_batch)
-                    val_losses.append(val_loss.detach())
-                    model.logger.log({"val_loss": val_loss})
-                arr = torch.tensor(val_losses)
-                if model.gpu_id == 0:
-                    print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
-                model.on_validation_epoch_end()
+                with torch.no_grad():
+                    if model.gpu_id == 0:
+                        logger.info("Validation step...")
+                    model.on_validation_epoch_start()
+                    val_losses = []
+                    for val_batch in tqdm.tqdm(valid_ds):
+                        for k, v in val_batch.items():
+                            if isinstance(v, torch.Tensor):
+                                val_batch[k] = v.to(model.gpu_id, non_blocking=True)
+                        val_loss = model.validation_step(val_batch)
+                        val_losses.append(val_loss.detach())
+                        model.logger.log({"val_loss": val_loss})
+                    arr = torch.tensor(val_losses)
+                    if model.gpu_id == 0:
+                        print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+                    model.on_validation_epoch_end()
 
             if (g_idx + 1) % config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
                 model.save_checkpoint(ckpt_path=ckpt_path, epoch=g_idx)

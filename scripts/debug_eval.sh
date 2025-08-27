@@ -22,8 +22,9 @@
 #  eval.compute_generative_perplexity=True \
 #  sampling.steps=99
 
-
 checkpoint_path=/home/jiangnan/workspace/mdlm-rev/outputs/wikitext2/2025.08.26/213908/checkpoints-epoch1.pt
+
+checkpoint_path=/home/jiangnan/workspace/mdlm-rev/outputs/wikitext2/2025.08.26/234154/checkpoints-epoch999.pt
 T=10
 echo "$T"
 python -m main \
@@ -34,8 +35,23 @@ python -m main \
     model=small \
     parameterization=subs \
     backbone=dit \
-    model.length=1024 \
+    model.length=32 \
     T="$T" \
     eval.checkpoint_path=$checkpoint_path \
+    wandb.name=mdlm-wiki2-eval
 #    +wandb.offline=true
 
+
+#### sample eval
+python -m main \
+    mode=sample_eval \
+    loader.batch_size=32 \
+    loader.eval_batch_size=32 \
+    data=wikitext2 \
+    model=small \
+    parameterization=subs \
+    backbone=dit \
+    model.length=100 \
+    T="$T" \
+    eval.checkpoint_path=$checkpoint_path \
+    wandb.name=mdlm-wiki2-eval
