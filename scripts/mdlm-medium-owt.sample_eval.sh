@@ -9,7 +9,7 @@ do
 		loader.batch_size=16 \
     loader.eval_batch_size=16 \
 		data=openwebtext-split \
-		model=small \
+		model=medium \
 		parameterization=subs \
 		backbone=dit \
 		model.length=1024 \
