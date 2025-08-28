@@ -344,8 +344,9 @@ def get_dataset(
             cache_dir, max_seq_length=block_size, crop_train=True)
     elif dataset_name == 'openwebtext-train':
         dataset = datasets.load_dataset(
-            'openwebtext',
-            split='train[:-100000]',
+            "Elriggs/openwebtext-100k",
+            # 'openwebtext',
+            # split='train[:-100000]',
             cache_dir=cache_dir,
             streaming=streaming)
     elif dataset_name == 'openwebtext-valid':
@@ -377,8 +378,7 @@ def get_dataset(
             cache_dir=cache_dir,
             streaming=streaming)
 
-    if dataset_name in ['lambada', 'openwebtext-train',
-                        'openwebtext-valid']:
+    if dataset_name in ['lambada', 'openwebtext-train', 'openwebtext-valid']:
         data = dataset
     else:
         data = dataset[mode]

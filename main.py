@@ -113,10 +113,8 @@ def generate_samples(config, logger, tokenizer):
             samples = model.restore_model_and_sample(num_steps=config.sampling.steps)
             text_samples = model.tokenizer.batch_decode(samples)
 
-            print(text_samples)
             model.compute_generative_perplexity(text_samples)
 
-    print('Text samples:', text_samples)
     if not config.sampling.semi_ar:
         print('Generative perplexity:', model.gen_ppl_metric.compute())
     return text_samples
