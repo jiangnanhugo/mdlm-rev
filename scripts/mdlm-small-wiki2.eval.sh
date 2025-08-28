@@ -1,4 +1,4 @@
-checkpoint_path=/home/jiangnan/workspace/mdlm-rev/outputs/wikitext2/2025.08.28/153734/checkpint-epoch
+checkpoint_path=/home/jiangnan/workspace/mdlm-rev/outputs/wikitext2/2025.08.28/153734/checkpiont-epoch
 
 #### sample eval
 for idx in 1999 3999 5999 7999 9999 11999 13999 15999 17999 17999 19999 21999 23999 25999 27999 29999;
