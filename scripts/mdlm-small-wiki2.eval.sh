@@ -17,7 +17,7 @@ do
 			model.length=1024 \
 			T="$T" \
 			sampling.steps=$T \
-			eval.checkpoint_path=$checkpoint_path \
+			eval.checkpoint_path=$checkpoint_path$idx.pt \
 			wandb.name=mdlm-wiki2-eval
 		done
 
