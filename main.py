@@ -87,7 +87,6 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 
 
 def generate_samples(config, logger, tokenizer):
-    logger.info('Generating samples.')
     model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
     model.gen_ppl_metric.reset()
     if config.eval.disable_ema:
@@ -282,7 +281,7 @@ def main(config):
     utils.seed_everything(config.seed)
 
     # Only print config on GPU 0 (main process) in DDP setting
-    if not os.environ.get("LOCAL_RANK") or int(os.environ["LOCAL_RANK"]) == 0:
+    if config.mode != "sample_eval" and (not os.environ.get("LOCAL_RANK") or int(os.environ["LOCAL_RANK"]) == 0):
         _print_config(config, resolve=True, save_cfg=True)
 
     logger = utils.get_logger(__name__)
