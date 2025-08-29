@@ -210,19 +210,19 @@ class Diffusion:
         print(f"Loaded model weights from {checkpoint_path}")
         return temp
 
-    def save_checkpoint(self, ckpt_path: str, epoch: int):
+    def save_checkpoint(self, ckpt_path: str, suffix: str):
         checkpoint = {
             "tokenizer": self.tokenizer,
             "config": self.config,
             "backbone": self.backbone.module.state_dict(),
             "noise": self.noise.state_dict(),
-            "EPOCHS_RUN": epoch,
+            # "EPOCHS_RUN": epoch,
         }
         if self.ema:
             checkpoint['ema'] = self.ema.state_dict()
 
-        torch.save(checkpoint, ckpt_path + "-epoch{}.pt".format(epoch))
-        print(f"Epoch {epoch} | Training snapshot saved at {ckpt_path}" + "-epoch{}.pt".format(epoch))
+        torch.save(checkpoint, ckpt_path + ".{}.pt".format(suffix))
+        print(f" Training snapshot saved at {ckpt_path}" + ".{}.pt".format(suffix))
 
     def on_train_start(self, train_dl):
 
@@ -444,7 +444,7 @@ class Diffusion:
     def validation_step(self, batch, batch_idx=None):
         return self._compute_loss(batch, prefix='val')
 
-    def on_validation_epoch_end(self):
+    def on_validation_epoch_end(self, logger):
         if (self.config.eval.compute_perplexity_on_sanity  # or not self.trainer.sanity_checking
                 and self.config.eval.generate_samples
                 and not self.parameterization == 'ar'):
@@ -460,12 +460,12 @@ class Diffusion:
             if hasattr(self.logger, 'log_table'):  # self.trainer.global_rank == 0 and
                 # Log the last generated samples
                 text_samples = text_samples[: self.config.sampling.num_sample_log]
-                self.logger.log_table(
+                logger.log_table(
                     key=f'samples@global_step{self.global_step}',
                     columns=['Generated Samples'],
                     data=[[s] for s in text_samples])
             if self.config.eval.compute_generative_perplexity:
-                self.logger.log({'val/gen_ppl': self.gen_ppl_metric})
+                logger.log({'val/gen_ppl': self.gen_ppl_metric})
 
         if self.ema:
             self.ema.restore(itertools.chain(self.backbone.parameters(), self.noise.parameters()))

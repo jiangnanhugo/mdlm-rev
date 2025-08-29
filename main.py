@@ -217,6 +217,7 @@ def _train(config, logger, tokenizer):
     g_idx = model.epochs_run
     # for ei in range(model.epochs_run, config.trainer.max_steps):
     ei=0
+    best_nll = float('inf')
     while True:
         losses = []
 
@@ -267,14 +268,18 @@ def _train(config, logger, tokenizer):
                                 val_batch[k] = v.to(model.gpu_id, non_blocking=True)
                         val_loss = model.validation_step(val_batch)
                         val_losses.append(val_loss.detach())
-                        model.logger.log({"val_loss": val_loss})
+                        # model.logger.log({"val_loss": val_loss})
                     arr = torch.tensor(val_losses)
                     if model.gpu_id == 0:
-                        print(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
-                    model.on_validation_epoch_end()
+                        logger.info(f"validation loss mean {torch.mean(arr):6f}, loss std {torch.std(arr):6f}")
+                    model.on_validation_epoch_end(logger)
+                    if torch.mean(arr) < best_nll:
+                        logger.info(f"find a better model! {torch.mean(arr)} -> {best_nll}")
+                        model.save_checkpoint(ckpt_path=ckpt_path, suffix="best")
+                        logger.info(f"Checkpoint saved at {ckpt_path}")
 
             if (g_idx + 1) % config.callbacks.checkpoint_every_n_steps.every_n_train_steps == 0:
-                model.save_checkpoint(ckpt_path=ckpt_path, epoch=g_idx)
+                model.save_checkpoint(ckpt_path=ckpt_path, suffix="last")
                 logger.info(f"Checkpoint saved at {ckpt_path}")
         ei+=1
 
