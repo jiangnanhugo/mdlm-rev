@@ -243,6 +243,8 @@ def _train(config, logger, tokenizer):
 
             # backward
             loss.backward()
+            # Apply gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.trainer.gradient_clip_val)
 
             # update parameters
             model.optimizer_step(optimizer, scheduler)
