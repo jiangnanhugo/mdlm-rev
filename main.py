@@ -6,6 +6,7 @@ import omegaconf
 import os
 import torch
 import tqdm
+import itertools
 
 import dataloader
 import diffusion
@@ -244,7 +245,10 @@ def _train(config, logger, tokenizer):
             # backward
             loss.backward()
             # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.trainer.gradient_clip_val)
+            # Clip gradients for the backbone and noise modules (Diffusion doesn't expose .parameters())
+            torch.nn.utils.clip_grad_norm_(
+                itertools.chain(model.backbone.parameters(), model.noise.parameters()),
+                float(config.trainer.gradient_clip_val))
 
             # update parameters
             model.optimizer_step(optimizer, scheduler)
