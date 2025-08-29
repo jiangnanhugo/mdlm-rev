@@ -12,8 +12,8 @@
 
 
 torchrun --standalone --nproc_per_node=2 -m main \
-  loader.batch_size=16 \
-  loader.eval_batch_size=16 \
+  loader.batch_size=4 \
+  loader.eval_batch_size=4 \
   model=small \
   data=wikitext2 \
   wandb.name=mdlm-wiki \
